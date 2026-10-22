@@ -951,6 +951,194 @@ invalid_transition_test!(
     }
 );
 
+// ─── submit_bounty Boundary and Edge-Case Test Suite ────────────────────────
+
+extern crate std;
+
+enum SubmitBountyExpected {
+    Success,
+    Error(ContractError),
+}
+
+struct SubmitBountyTestCase {
+    name: &'static str,
+    setup_status: Option<BountyStatus>,
+    bounty_id_override: Option<u64>,
+    use_wrong_contributor: bool,
+    expire_before_submit: bool,
+    expected: SubmitBountyExpected,
+}
+
+#[test]
+fn test_submit_bounty_boundaries() {
+    let test_cases = [
+        SubmitBountyTestCase {
+            name: "bounty_id is 0 (nonexistent boundary ID)",
+            setup_status: None,
+            bounty_id_override: Some(0),
+            use_wrong_contributor: false,
+            expire_before_submit: false,
+            expected: SubmitBountyExpected::Error(ContractError::BountyNotFound),
+        },
+        SubmitBountyTestCase {
+            name: "bounty_id is large nonexistent ID (999_999)",
+            setup_status: None,
+            bounty_id_override: Some(999_999),
+            use_wrong_contributor: false,
+            expire_before_submit: false,
+            expected: SubmitBountyExpected::Error(ContractError::BountyNotFound),
+        },
+        SubmitBountyTestCase {
+            name: "bounty in Open status (cannot submit unreserved bounty)",
+            setup_status: Some(BountyStatus::Open),
+            bounty_id_override: None,
+            use_wrong_contributor: false,
+            expire_before_submit: false,
+            expected: SubmitBountyExpected::Error(ContractError::BountyMustBeReserved),
+        },
+        SubmitBountyTestCase {
+            name: "bounty in Submitted status (cannot submit an already-submitted bounty)",
+            setup_status: Some(BountyStatus::Submitted),
+            bounty_id_override: None,
+            use_wrong_contributor: false,
+            expire_before_submit: false,
+            expected: SubmitBountyExpected::Error(ContractError::BountyMustBeReserved),
+        },
+        SubmitBountyTestCase {
+            name: "bounty in Released status (terminal released state)",
+            setup_status: Some(BountyStatus::Released),
+            bounty_id_override: None,
+            use_wrong_contributor: false,
+            expire_before_submit: false,
+            expected: SubmitBountyExpected::Error(ContractError::BountyMustBeReserved),
+        },
+        SubmitBountyTestCase {
+            name: "bounty in Refunded status (terminal refunded state)",
+            setup_status: Some(BountyStatus::Refunded),
+            bounty_id_override: None,
+            use_wrong_contributor: false,
+            expire_before_submit: false,
+            expected: SubmitBountyExpected::Error(ContractError::BountyMustBeReserved),
+        },
+        SubmitBountyTestCase {
+            name: "bounty in Expired status",
+            setup_status: Some(BountyStatus::Expired),
+            bounty_id_override: None,
+            use_wrong_contributor: false,
+            expire_before_submit: false,
+            expected: SubmitBountyExpected::Error(ContractError::BountyMustBeReserved),
+        },
+        SubmitBountyTestCase {
+            name: "bounty in Disputed status",
+            setup_status: Some(BountyStatus::Disputed),
+            bounty_id_override: None,
+            use_wrong_contributor: false,
+            expire_before_submit: false,
+            expected: SubmitBountyExpected::Error(ContractError::BountyMustBeReserved),
+        },
+        SubmitBountyTestCase {
+            name: "bounty in Reserved status but past deadline (deadline boundary: expired at submission time)",
+            setup_status: Some(BountyStatus::Reserved),
+            bounty_id_override: None,
+            use_wrong_contributor: false,
+            expire_before_submit: true,
+            expected: SubmitBountyExpected::Error(ContractError::BountyMustBeReserved),
+        },
+        SubmitBountyTestCase {
+            name: "bounty in Reserved status but submitted by wrong contributor (contributor mismatch boundary)",
+            setup_status: Some(BountyStatus::Reserved),
+            bounty_id_override: None,
+            use_wrong_contributor: true,
+            expire_before_submit: false,
+            expected: SubmitBountyExpected::Error(ContractError::ContributorMismatch),
+        },
+        SubmitBountyTestCase {
+            name: "bounty in Reserved status submitted by legitimate contributor within deadline (valid boundary)",
+            setup_status: Some(BountyStatus::Reserved),
+            bounty_id_override: None,
+            use_wrong_contributor: false,
+            expire_before_submit: false,
+            expected: SubmitBountyExpected::Success,
+        },
+    ];
+
+    for tc in test_cases.iter() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin, maintainer, contributor, token_id, _fee_recipient, arbiter) =
+            setup_test(&env);
+        let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+        token_admin.mint(&maintainer, &1000);
+
+        let other_contributor = Address::generate(&env);
+
+        let bounty_id = if let Some(override_id) = tc.bounty_id_override {
+            override_id
+        } else {
+            create_bounty_with_state(
+                &env,
+                &client,
+                maintainer.clone(),
+                contributor.clone(),
+                token_id.clone(),
+                tc.setup_status.unwrap_or(BountyStatus::Open),
+                arbiter.clone(),
+            )
+        };
+
+        if tc.expire_before_submit {
+            let bounty = client.get_bounty(&bounty_id);
+            env.ledger().set_timestamp(bounty.deadline + 1);
+        }
+
+        let submit_caller = if tc.use_wrong_contributor {
+            other_contributor
+        } else {
+            contributor.clone()
+        };
+
+        // `panic_error` panics with the variant's Debug name, so we capture the
+        // panic and assert the exact named `ContractError` variant.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.submit_bounty(&bounty_id, &submit_caller);
+        }));
+
+        match &tc.expected {
+            SubmitBountyExpected::Success => {
+                assert!(outcome.is_ok(), "expected success for case: {}", tc.name);
+                let updated = client.get_bounty(&bounty_id);
+                assert_eq!(updated.status, BountyStatus::Submitted, "case: {}", tc.name);
+                assert_eq!(updated.contributor, Some(contributor.clone()), "case: {}", tc.name);
+            }
+            SubmitBountyExpected::Error(expected_err) => {
+                let payload = match outcome {
+                    Ok(()) => panic!(
+                        "expected {:?} but call succeeded for case: {}",
+                        expected_err, tc.name
+                    ),
+                    Err(p) => p,
+                };
+                let msg = if let Some(s) = payload.downcast_ref::<std::string::String>() {
+                    s.clone()
+                } else if let Some(s) = payload.downcast_ref::<&str>() {
+                    std::string::String::from(*s)
+                } else {
+                    std::string::String::new()
+                };
+                let expected_name = std::format!("{:?}", expected_err);
+                assert!(
+                    msg.contains(&expected_name),
+                    "case `{}`: expected error variant {} but panic was: {}",
+                    tc.name,
+                    expected_name,
+                    msg
+                );
+            }
+        }
+    }
+}
+
 invalid_transition_test!(release_open, BountyStatus::Open, "BountyMustBeSubmitted", {
     |client: &StellarBountyBoardContractClient<'static>,
      bounty_id: u64,
